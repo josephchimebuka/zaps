@@ -6,14 +6,21 @@ use crate::{
     models::{BuildTransactionDto, SignedTransactionResponse, TransactionStatus},
 };
 use base64::{engine::general_purpose, Engine as _};
-use serde_json::json;
+use reqwest::Client as HttpClient;
+use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
+use tokio::time::{sleep, Duration};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signer};
+use hex as hex_crate;
 
 // Mocking Stellar SDK types for now as we don't have the full crate docs loaded
 // In a real scenario, these would be imports from a Stellar SDK/crate
 pub struct StellarClient {
     pub network_passphrase: String,
     pub rpc_url: String,
+    http: HttpClient,
 }
 
 impl StellarClient {
@@ -21,12 +28,132 @@ impl StellarClient {
         Self {
             network_passphrase,
             rpc_url,
+            http: HttpClient::new(),
         }
     }
 
-    pub async fn submit_transaction(&self, _tx_envelope: &str) -> Result<String, String> {
-        // Mock submission
-        Ok("mock_tx_hash".to_string())
+    /// Submit a signed transaction XDR (base64) to the Soroban RPC using
+    /// the JSON-RPC `send_transaction` method. Returns the transaction hash
+    /// on success or an error message.
+    pub async fn submit_transaction(&self, tx_envelope: &str) -> Result<String, String> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "send_transaction",
+            "params": [tx_envelope]
+        });
+
+        let res = self
+            .http
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("rpc request failed: {}", e))?;
+
+        let status = res.status();
+        let text = res
+            .text()
+            .await
+            .map_err(|e| format!("reading response failed: {}", e))?;
+
+        if !status.is_success() {
+            return Err(format!("rpc returned {}: {}", status, text));
+        }
+
+        let v: JsonValue = serde_json::from_str(&text)
+            .map_err(|e| format!("invalid json from rpc: {} -- {}", e, text))?;
+
+        if let Some(err) = v.get("error") {
+            return Err(format!("rpc error: {}", err));
+        }
+
+        // Try to extract a hash from result
+        if let Some(hash) = v.get("result").and_then(|r| r.get("hash")).and_then(|h| h.as_str()) {
+            return Ok(hash.to_string());
+        }
+
+        // Fallback: sometimes result may directly be a string hash
+        if let Some(s) = v.get("result").and_then(|r| r.as_str()) {
+            return Ok(s.to_string());
+        }
+
+        Err(format!("unexpected rpc response: {}", text))
+    }
+
+    /// Simulate a transaction via JSON-RPC `simulate_transaction`.
+    /// Returns the raw simulation JSON on success.
+    pub async fn simulate_transaction(&self, tx_envelope: &str) -> Result<JsonValue, String> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "simulate_transaction",
+            "params": [tx_envelope, {"latestLedger":"true"}]
+        });
+
+        let res = self
+            .http
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("rpc request failed: {}", e))?;
+
+        let status = res.status();
+        let text = res
+            .text()
+            .await
+            .map_err(|e| format!("reading response failed: {}", e))?;
+
+        if !status.is_success() {
+            return Err(format!("rpc returned {}: {}", status, text));
+        }
+
+        let v: JsonValue = serde_json::from_str(&text)
+            .map_err(|e| format!("invalid json from rpc: {} -- {}", e, text))?;
+
+        if let Some(err) = v.get("error") {
+            return Err(format!("rpc error: {}", err));
+        }
+
+        Ok(v)
+    }
+
+    /// Query transaction status via JSON-RPC `get_transaction` and return raw JSON.
+    pub async fn get_transaction(&self, hash: &str) -> Result<JsonValue, String> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "get_transaction",
+            "params": [hash]
+        });
+
+        let res = self
+            .http
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("rpc request failed: {}", e))?;
+
+        let status = res.status();
+        let text = res
+            .text()
+            .await
+            .map_err(|e| format!("reading response failed: {}", e))?;
+
+        if !status.is_success() {
+            return Err(format!("rpc returned {}: {}", status, text));
+        }
+
+        let v: JsonValue = serde_json::from_str(&text)
+            .map_err(|e| format!("invalid json from rpc: {} -- {}", e, text))?;
+
+        if let Some(err) = v.get("error") {
+            return Err(format!("rpc error: {}", err));
+        }
+
+        Ok(v)
     }
 }
 
@@ -61,9 +188,67 @@ impl CustodialSigner {
 #[async_trait]
 impl Signer for CustodialSigner {
     async fn sign_transaction(&self, tx_xdr: &str) -> Result<String, ApiError> {
-        // Mock signing logic
-        // In reality: Parse XDR, sign with key, return new XDR
-        Ok(format!("{}_signed_by_custodial", tx_xdr))
+        // Basic sponsorship wrapper: if the incoming payload is base64-encoded
+        // JSON (our builder returns base64 JSON), decode it and wrap it in a
+        // sponsored envelope signed with an HMAC using the configured secret.
+        // This avoids adding heavy XDR handling while providing a deterministic
+        // server-side sponsorship artifact that can be submitted or returned
+        // to clients.
+        let decoded = match general_purpose::STANDARD.decode(tx_xdr) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(_) => tx_xdr.to_string(),
+        };
+
+        let decoded_bytes = decoded.into_bytes();
+
+        // Try hex seed ed25519 signing (32-byte seed in hex). If the
+        // configured secret parses as hex 32 bytes, perform ed25519
+        // signing and return envelope with `ed25519` signature. Otherwise
+        // fallback to HMAC-based sponsorship.
+        if let Ok(seed) = hex_crate::decode(&self.secret_key) {
+            if seed.len() == 32 {
+                let secret = SecretKey::from_bytes(&seed).map_err(|_| ApiError::InternalServerError)?;
+                let public = PublicKey::from(&secret);
+                let keypair = Keypair { secret, public };
+
+                let sig = keypair.sign(&decoded_bytes);
+                let sig_b64 = general_purpose::STANDARD.encode(sig.to_bytes());
+
+                let envelope = json!({
+                    "type": "sponsored_transaction",
+                    "sponsored_by": "fee_payer_custodial",
+                    "signature_type": "ed25519",
+                    "envelope": general_purpose::STANDARD.encode(&decoded_bytes),
+                    "signature": sig_b64,
+                    "pubkey": general_purpose::STANDARD.encode(public.as_bytes()),
+                });
+
+                let raw = envelope.to_string();
+                let out = general_purpose::STANDARD.encode(raw.as_bytes());
+                return Ok(out);
+            }
+        }
+
+        // Fallback HMAC-SHA256
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(self.secret_key.as_bytes())
+            .map_err(|_| ApiError::InternalServerError)?;
+        mac.update(&decoded_bytes);
+        let result = mac.finalize();
+        let sig_bytes = result.into_bytes();
+        let sig_b64 = general_purpose::STANDARD.encode(&sig_bytes);
+
+        let envelope = json!({
+            "type": "sponsored_transaction",
+            "sponsored_by": "fee_payer_custodial",
+            "signature_type": "hmac-sha256",
+            "envelope": general_purpose::STANDARD.encode(&decoded_bytes),
+            "signature": sig_b64,
+        });
+
+        let raw = envelope.to_string();
+        let out = general_purpose::STANDARD.encode(raw.as_bytes());
+        Ok(out)
     }
 }
 
@@ -95,17 +280,114 @@ impl SorobanService {
         &self,
         signed_tx_xdr: String,
     ) -> Result<SignedTransactionResponse, ApiError> {
-        match self.client.submit_transaction(&signed_tx_xdr).await {
-            Ok(hash) => Ok(SignedTransactionResponse {
-                tx_hash: hash,
-                status: TransactionStatus::PENDING,
-            }),
-            Err(e) => Err(self.normalize_error(e)),
+        // Submit to RPC
+        let hash = self
+            .client
+            .submit_transaction(&signed_tx_xdr)
+            .await
+            .map_err(|e| self.normalize_error(e))?;
+
+        // Poll for final status with backoff
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            // Query transaction status
+            match self.client.get_transaction(&hash).await {
+                Ok(json) => {
+                    // Try to interpret known status fields
+                    if let Some(result) = json.get("result") {
+                        // Many implementations return `status` or nested status
+                        if let Some(status_str) = result.get("status").and_then(|s| s.as_str()) {
+                            match status_str {
+                                "NOT_FOUND" | "not_found" => {
+                                    // keep polling
+                                }
+                                "SUCCESS" | "success" | "CONFIRMED" | "confirmed" => {
+                                    return Ok(SignedTransactionResponse {
+                                        tx_hash: hash,
+                                        status: TransactionStatus::CONFIRMED,
+                                    });
+                                }
+                                "FAILED" | "failed" => {
+                                    return Ok(SignedTransactionResponse {
+                                        tx_hash: hash,
+                                        status: TransactionStatus::FAILED,
+                                    });
+                                }
+                                _ => {
+                                    // Unexpected, continue polling a few times
+                                }
+                            }
+                        } else if let Some(status_val) = result.get("status") {
+                            // fallback: numeric or other
+                            let s = status_val.to_string();
+                            if s.to_lowercase().contains("failed") {
+                                return Ok(SignedTransactionResponse {
+                                    tx_hash: hash,
+                                    status: TransactionStatus::FAILED,
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // treat RPC read errors as transient and retry
+                }
+            }
+
+            if attempts > 30 {
+                // timeout
+                return Ok(SignedTransactionResponse {
+                    tx_hash: hash,
+                    status: TransactionStatus::PENDING,
+                });
+            }
+
+            sleep(Duration::from_millis(1000)).await;
         }
     }
 
-    fn normalize_error(&self, _: String) -> ApiError {
-        // Normalize Soroban/Stellar errors into ApiError
+    fn normalize_error(&self, raw: String) -> ApiError {
+        // Try to parse structured RPC JSON first
+        if let Ok(json): Result<serde_json::Value, _> = serde_json::from_str(&raw) {
+            // JSON-RPC error object
+            if let Some(err) = json.get("error") {
+                // Try to extract a message/code
+                let msg = if let Some(m) = err.get("message") {
+                    m.as_str().unwrap_or(&err.to_string()).to_string()
+                } else {
+                    err.to_string()
+                };
+
+                let lower = msg.to_lowercase();
+                if lower.contains("validation") || lower.contains("invalid") || lower.contains("bad request") {
+                    return ApiError::Validation(msg);
+                }
+                return ApiError::Stellar(msg);
+            }
+
+            // Some RPCs place error info inside result.error
+            if let Some(result) = json.get("result") {
+                if let Some(err) = result.get("error") {
+                    let msg = err.as_str().unwrap_or(&err.to_string()).to_string();
+                    let lower = msg.to_lowercase();
+                    if lower.contains("validation") || lower.contains("invalid") || lower.contains("bad request") {
+                        return ApiError::Validation(msg);
+                    }
+                    return ApiError::Stellar(msg);
+                }
+            }
+        }
+
+        // Fallback: simple substring mapping on raw text
+        let lower = raw.to_lowercase();
+        if lower.contains("validation") || lower.contains("invalid") || lower.contains("bad request") {
+            return ApiError::Validation(raw);
+        }
+        if lower.contains("stellar") || lower.contains("soroban") || lower.contains("rpc") || lower.contains("tx failed") {
+            return ApiError::Stellar(raw);
+        }
+
         ApiError::InternalServerError
     }
 
@@ -160,29 +442,45 @@ impl SorobanService {
 
     // Simulate a transaction to estimate fee and footprint (mocked)
     pub async fn simulate_transaction(&self, tx_xdr_base64: &str) -> Result<(u32, u32), ApiError> {
-        // In production: call /simulate on RPC to get accurate fee/footprint
-        // Here, decode and give basic estimates
+        // Try to call the RPC simulate endpoint for a better estimate.
         if tx_xdr_base64.is_empty() {
             return Err(ApiError::Validation("Empty transaction XDR".to_string()));
         }
 
-        // Simple heuristic: native payments cheaper than issued
-        let decoded = general_purpose::STANDARD
-            .decode(tx_xdr_base64)
-            .map_err(|_| ApiError::Validation("Invalid XDR encoding".to_string()))?;
-        let s = String::from_utf8_lossy(&decoded);
-        let fee = if s.contains("\"asset\":\"XLM\"") {
-            100
-        } else {
-            200
-        };
-        let footprint = if s.contains("\"asset\":\"XLM\"") {
-            1
-        } else {
-            2
-        };
+        match self.client.simulate_transaction(tx_xdr_base64).await {
+            Ok(json) => {
+                // Parse minResourceFee if present
+                let mut fee: u32 = 0;
+                let mut footprint: u32 = 0;
 
-        Ok((fee, footprint))
+                if let Some(result) = json.get("result") {
+                    if let Some(min_fee) = result.get("minResourceFee").and_then(|v| v.as_str()) {
+                        if let Ok(parsed) = min_fee.parse::<u32>() {
+                            fee = parsed;
+                        }
+                    }
+
+                    if let Some(txdata) = result.get("transactionData") {
+                        // footprint size heuristic
+                        if txdata.get("instructions").is_some() {
+                            footprint = 1;
+                        } else {
+                            footprint = 1;
+                        }
+                    }
+                }
+
+                if fee == 0 {
+                    fee = 100;
+                }
+                if footprint == 0 {
+                    footprint = 1;
+                }
+
+                Ok((fee, footprint))
+            }
+            Err(e) => Err(self.normalize_error(e)),
+        }
     }
 
     // Sign transaction as fee payer (fee sponsorship) using server-side signer
@@ -198,16 +496,59 @@ impl SorobanService {
         let signer = self.fee_payer_signer.as_ref().unwrap();
         signer.sign_transaction(tx_xdr_base64).await
     }
+
+    /// Simulate a read-only contract call and return the raw simulation `retval` JSON if present.
+    pub async fn simulate_contract_read(
+        &self,
+        contract_id: &str,
+        method: &str,
+        args: Vec<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, ApiError> {
+        // Build the contract invocation payload (base64) using our builder
+        let dto = BuildTransactionDto {
+            contract_id: contract_id.to_string(),
+            method: method.to_string(),
+            args,
+        };
+
+        let tx_xdr = self.build_transaction(dto).await?;
+
+        let sim_json = self
+            .client
+            .simulate_transaction(&tx_xdr)
+            .await
+            .map_err(|e| self.normalize_error(e))?;
+
+        if let Some(result) = sim_json.get("result") {
+            if let Some(error) = result.get("error") {
+                return Err(ApiError::Stellar(format!("simulation error: {}", error)));
+            }
+
+            if let Some(retval) = result.get("retval") {
+                return Ok(Some(retval.clone()));
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 #[async_trait]
 impl TransactionBuilder for SorobanService {
     async fn build_transaction(&self, dto: BuildTransactionDto) -> Result<String, ApiError> {
-        // Mock transaction building for contract invocations
-        let tx_xdr = format!(
-            "mock_xdr_invoke_{}_{}_{:?}",
-            dto.contract_id, dto.method, dto.args
-        );
-        Ok(tx_xdr)
+        // Build a lightweight JSON representation of the contract invocation
+        // and return it as base64 so callers (clients) receive an opaque
+        // payload they can simulate/sign. This mirrors the earlier mock
+        // but provides structured data for potential RPC simulation.
+        let payload = json!({
+            "type": "contract_invoke",
+            "contract_id": dto.contract_id,
+            "method": dto.method,
+            "args": dto.args,
+        });
+
+        let raw = payload.to_string();
+        let encoded = general_purpose::STANDARD.encode(raw.as_bytes());
+        Ok(encoded)
     }
 }
