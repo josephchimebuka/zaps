@@ -25,6 +25,8 @@ pub fn user_routes(pool: sqlx::PgPool) -> Router {
         .route("/search", get(user::search_users))
         .route("/friends", get(user::list_friends))
         .route("/friends/request", post(user::send_friend_request))
+        .route("/friends/:id/accept", post(user::accept_friend_request))
+        .route("/friends/:id/reject", post(user::reject_friend_request))
         .with_state(pool)
 }
 

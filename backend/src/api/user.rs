@@ -1,7 +1,13 @@
 use crate::api::feed::AuthUser;
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use uuid::Uuid;
 
 #[derive(Deserialize)]
 pub struct UpdateProfileRequest {
@@ -54,7 +60,7 @@ pub async fn get_profile(State(pool): State<sqlx::PgPool>, auth: AuthUser) -> im
         Err(e) => {
             tracing::error!("Database query error in get_profile: {:?}", e);
             return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "Internal database error" })),
             )
                 .into_response();
@@ -97,7 +103,7 @@ pub async fn update_profile(
         Err(e) => {
             tracing::error!("Database update error in update_profile: {:?}", e);
             return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "Failed to update profile" })),
             )
                 .into_response();
@@ -141,7 +147,7 @@ pub async fn search_users(
         Err(e) => {
             tracing::error!("Search users query failed: {:?}", e);
             return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "Internal database error" })),
             )
                 .into_response();
@@ -180,7 +186,7 @@ pub async fn list_friends(State(pool): State<sqlx::PgPool>, auth: AuthUser) -> i
         Err(e) => {
             tracing::error!("Failed to fetch friends: {:?}", e);
             return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "Internal database error" })),
             )
                 .into_response();
@@ -199,7 +205,174 @@ pub async fn list_friends(State(pool): State<sqlx::PgPool>, auth: AuthUser) -> i
     Json(friends).into_response()
 }
 
-pub async fn send_friend_request(Json(_payload): Json<FriendRequest>) -> impl IntoResponse {
-    // TODO: Implement BE-011 (Send friend request endpoint)
-    Json(serde_json::json!({ "status": "pending" }))
+/// POST /api/users/friends/request
+/// Sends a friend request from the authenticated user to `friend_address`.
+/// Returns 409 if a friendship record already exists in either direction.
+pub async fn send_friend_request(
+    State(pool): State<sqlx::PgPool>,
+    auth: AuthUser,
+    Json(payload): Json<FriendRequest>,
+) -> impl IntoResponse {
+    // Resolve the target user's id from their address.
+    let friend_id: Uuid = match sqlx::query_scalar("SELECT id FROM users WHERE address = $1")
+        .bind(&payload.friend_address)
+        .fetch_optional(&pool)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "User not found" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("send_friend_request lookup failed: {:?}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal database error" })),
+            )
+                .into_response();
+        }
+    };
+
+    if friend_id == auth.id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Cannot send a friend request to yourself" })),
+        )
+            .into_response();
+    }
+
+    // Guard: reject if any friendship record already exists in either direction.
+    let exists: bool = match sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM friendships
+            WHERE (user_id = $1 AND friend_id = $2)
+               OR (user_id = $2 AND friend_id = $1)
+        )
+        "#,
+    )
+    .bind(auth.id)
+    .bind(friend_id)
+    .fetch_one(&pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("send_friend_request existence check failed: {:?}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal database error" })),
+            )
+                .into_response();
+        }
+    };
+
+    if exists {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "Friend request already exists" })),
+        )
+            .into_response();
+    }
+
+    match sqlx::query(
+        "INSERT INTO friendships (user_id, friend_id, status) VALUES ($1, $2, 'PENDING')",
+    )
+    .bind(auth.id)
+    .bind(friend_id)
+    .execute(&pool)
+    .await
+    {
+        Ok(_) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "status": "PENDING" })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("send_friend_request insert failed: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Failed to send friend request" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /api/users/friends/:id/accept
+/// Accepts an incoming PENDING friend request where the authenticated user is
+/// the recipient (friend_id).
+pub async fn accept_friend_request(
+    State(pool): State<sqlx::PgPool>,
+    auth: AuthUser,
+    Path(friendship_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match sqlx::query(
+        r#"
+        UPDATE friendships
+        SET status = 'ACCEPTED'
+        WHERE id = $1 AND friend_id = $2 AND status = 'PENDING'
+        "#,
+    )
+    .bind(friendship_id)
+    .bind(auth.id)
+    .execute(&pool)
+    .await
+    {
+        Ok(result) if result.rows_affected() == 0 => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Pending friend request not found" })),
+        )
+            .into_response(),
+        Ok(_) => Json(serde_json::json!({ "status": "ACCEPTED" })).into_response(),
+        Err(e) => {
+            tracing::error!("accept_friend_request failed: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal database error" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /api/users/friends/:id/reject
+/// Rejects an incoming PENDING friend request where the authenticated user is
+/// the recipient (friend_id).
+pub async fn reject_friend_request(
+    State(pool): State<sqlx::PgPool>,
+    auth: AuthUser,
+    Path(friendship_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match sqlx::query(
+        r#"
+        UPDATE friendships
+        SET status = 'REJECTED'
+        WHERE id = $1 AND friend_id = $2 AND status = 'PENDING'
+        "#,
+    )
+    .bind(friendship_id)
+    .bind(auth.id)
+    .execute(&pool)
+    .await
+    {
+        Ok(result) if result.rows_affected() == 0 => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Pending friend request not found" })),
+        )
+            .into_response(),
+        Ok(_) => Json(serde_json::json!({ "status": "REJECTED" })).into_response(),
+        Err(e) => {
+            tracing::error!("reject_friend_request failed: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal database error" })),
+            )
+                .into_response()
+        }
+    }
 }
