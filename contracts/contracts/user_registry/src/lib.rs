@@ -8,6 +8,7 @@ pub struct UserRegistryContract;
 // Storage keys for persistent storage
 const ADDRESS_TO_USERNAME: &str = "address_to_username";
 const USERNAME_TO_ADDRESS: &str = "username_to_address";
+const ADDRESS_TO_AVATAR: &str = "address_to_avatar";
 
 #[contractimpl]
 impl UserRegistryContract {
@@ -63,8 +64,68 @@ impl UserRegistryContract {
 
     /// Update user profile metadata (e.g. avatar URI)
     pub fn update_profile(env: Env, user: Address, avatar_uri: String) {
-        // TODO: Implement SC-003 (Update profile avatar URI)
         user.require_auth();
-        panic!("unimplemented: update_profile");
+
+        let avatar_key = String::from_str(&env, ADDRESS_TO_AVATAR);
+        let mut address_to_avatar: Map<Address, String> = env.storage().persistent().get(&avatar_key)
+            .unwrap_or(Map::new(&env));
+        
+        address_to_avatar.set(user, avatar_uri);
+        env.storage().persistent().set(&avatar_key, &address_to_avatar);
+    }
+
+    /// Retrieve the avatar URI associated with an Address
+    pub fn get_avatar(env: Env, user: Address) -> String {
+        let avatar_key = String::from_str(&env, ADDRESS_TO_AVATAR);
+        let address_to_avatar: Map<Address, String> = env.storage().persistent().get(&avatar_key)
+            .unwrap_or(Map::new(&env));
+        
+        address_to_avatar.get(user)
+            .unwrap_or_else(|| String::from_str(&env, ""))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn test_register_and_update_profile() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, UserRegistryContract);
+        let client = UserRegistryContractClient::new(&env, &contract_id);
+
+        let user = Address::generate(&env);
+        let username = String::from_str(&env, "ebube");
+        
+        // Register user
+        client.register_user(&user, &username);
+        assert_eq!(client.get_address(&username), user);
+        assert_eq!(client.get_username(&user), username);
+
+        // Update profile
+        let avatar_uri = String::from_str(&env, "https://example.com/avatar.png");
+        client.update_profile(&user, &avatar_uri);
+        
+        assert_eq!(client.get_avatar(&user), avatar_uri);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_profile_fails_without_auth() {
+        let env = Env::default();
+        // Do NOT mock all auths here
+
+        let contract_id = env.register_contract(None, UserRegistryContract);
+        let client = UserRegistryContractClient::new(&env, &contract_id);
+
+        let user = Address::generate(&env);
+        let avatar_uri = String::from_str(&env, "https://example.com/avatar.png");
+
+        // This should panic due to missing authorization
+        client.update_profile(&user, &avatar_uri);
     }
 }

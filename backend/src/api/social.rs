@@ -27,14 +27,137 @@ pub struct CommentResponse {
     pub created_at: String,
 }
 
-pub async fn like_payment(Json(_payload): Json<LikeRequest>) -> impl IntoResponse {
-    // TODO: Implement BE-009 (Like payment action)
-    Json(serde_json::json!({ "success": true }))
+pub async fn like_payment(
+    State(pool): State<sqlx::PgPool>,
+    auth: AuthUser,
+    Json(payload): Json<LikeRequest>,
+) -> impl IntoResponse {
+    let payment_id = match uuid::Uuid::parse_str(&payload.payment_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Invalid payment ID" })),
+            )
+                .into_response();
+        }
+    };
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO likes (payment_id, user_id)
+        VALUES ($1, $2)
+        ON CONFLICT (payment_id, user_id) DO NOTHING
+        "#,
+    )
+    .bind(payment_id)
+    .bind(auth.id)
+    .execute(&pool)
+    .await;
+
+    if let Err(e) = result {
+        tracing::error!("Failed to like payment: {:?}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Failed to like payment" })),
+        )
+            .into_response();
+    }
+
+    let count_result = sqlx::query(
+        r#"
+        SELECT COUNT(*) as count FROM likes WHERE payment_id = $1
+        "#,
+    )
+    .bind(payment_id)
+    .fetch_one(&pool)
+    .await;
+
+    match count_result {
+        Ok(row) => {
+            let count: i64 = row.get("count");
+            Json(serde_json::json!({
+                "success": true,
+                "likes_count": count as usize,
+                "has_liked": true
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to get likes count: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Failed to retrieve updated like count" })),
+            )
+                .into_response()
+        }
+    }
 }
 
-pub async fn unlike_payment(Json(_payload): Json<LikeRequest>) -> impl IntoResponse {
-    // TODO: Implement BE-009 (Unlike payment action)
-    Json(serde_json::json!({ "success": true }))
+pub async fn unlike_payment(
+    State(pool): State<sqlx::PgPool>,
+    auth: AuthUser,
+    Json(payload): Json<LikeRequest>,
+) -> impl IntoResponse {
+    let payment_id = match uuid::Uuid::parse_str(&payload.payment_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Invalid payment ID" })),
+            )
+                .into_response();
+        }
+    };
+
+    let result = sqlx::query(
+        r#"
+        DELETE FROM likes
+        WHERE payment_id = $1 AND user_id = $2
+        "#,
+    )
+    .bind(payment_id)
+    .bind(auth.id)
+    .execute(&pool)
+    .await;
+
+    if let Err(e) = result {
+        tracing::error!("Failed to unlike payment: {:?}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Failed to unlike payment" })),
+        )
+            .into_response();
+    }
+
+    let count_result = sqlx::query(
+        r#"
+        SELECT COUNT(*) as count FROM likes WHERE payment_id = $1
+        "#,
+    )
+    .bind(payment_id)
+    .fetch_one(&pool)
+    .await;
+
+    match count_result {
+        Ok(row) => {
+            let count: i64 = row.get("count");
+            Json(serde_json::json!({
+                "success": true,
+                "likes_count": count as usize,
+                "has_liked": false
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to get likes count: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Failed to retrieve updated like count" })),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub async fn add_comment(
