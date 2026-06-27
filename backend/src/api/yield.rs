@@ -6,9 +6,12 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
+
+use crate::services::yield_calc;
 
 // ── #373 — GET /api/yield/balance ─────────────────────────────────────────
 
@@ -16,8 +19,13 @@ use uuid::Uuid;
 pub struct YieldBalanceResponse {
     pub available_balance: i64,
     pub earning_balance: i64,
+    /// Interest accrued since the last on-chain sync (micro-units).
+    pub accrued_interest: i64,
+    /// Earning balance including live accrued interest.
+    pub total_earning_balance: i64,
     /// Current APY as a percentage (e.g., 5.0 for 5%).
     pub apy: f64,
+    pub auto_earn_enabled: bool,
 }
 
 pub async fn get_balance(State(pool): State<sqlx::PgPool>, auth: AuthUser) -> impl IntoResponse {
@@ -46,10 +54,28 @@ pub async fn get_balance(State(pool): State<sqlx::PgPool>, auth: AuthUser) -> im
         }
     };
 
+    let estimate = yield_calc::estimate_for_balance(&balance, Some(apy_bps), Utc::now());
+
+    let auto_earn_enabled =
+        match crate::db::r#yield::get_auto_earn_enabled(&pool, auth.id).await {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                tracing::error!("auto-earn preference fetch error: {:?}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "Failed to retrieve auto-earn preference" })),
+                )
+                    .into_response();
+            }
+        };
+
     Json(YieldBalanceResponse {
         available_balance: balance.available_balance,
         earning_balance: balance.earning_balance,
+        accrued_interest: estimate.accrued_interest,
+        total_earning_balance: estimate.total_earning_balance,
         apy: apy_bps as f64 / 100.0,
+        auto_earn_enabled,
     })
     .into_response()
 }
@@ -155,6 +181,46 @@ pub async fn get_history(
     .into_response()
 }
 
+// ── #378 — POST /api/yield/toggle-auto ────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ToggleAutoEarnRequest {
+    pub enabled: bool,
+}
+
+#[derive(Serialize)]
+pub struct ToggleAutoEarnResponse {
+    pub auto_earn_enabled: bool,
+    pub message: String,
+}
+
+pub async fn toggle_auto_earn(
+    State(pool): State<sqlx::PgPool>,
+    auth: AuthUser,
+    Json(payload): Json<ToggleAutoEarnRequest>,
+) -> impl IntoResponse {
+    match crate::db::r#yield::set_auto_earn_enabled(&pool, auth.id, payload.enabled).await {
+        Ok(enabled) => Json(ToggleAutoEarnResponse {
+            auto_earn_enabled: enabled,
+            message: if enabled {
+                "Auto-earn enabled. Idle stablecoins will be swept into the yield vault."
+                    .to_string()
+            } else {
+                "Auto-earn disabled.".to_string()
+            },
+        })
+        .into_response(),
+        Err(e) => {
+            tracing::error!("toggle auto-earn error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Failed to update auto-earn preference" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 // ── #375 — POST /api/yield/deposit ────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -243,6 +309,7 @@ pub async fn deposit(
             ON CONFLICT (user_id) DO UPDATE
             SET available_balance = user_yield_balances.available_balance - $2,
                 earning_balance   = user_yield_balances.earning_balance   + $2,
+                last_yield_sync_at  = NOW(),
                 updated_at        = NOW()
             "#,
         )

@@ -196,6 +196,20 @@ async fn main() {
         api::bridge::run_status_poller(bridge_state).await;
     });
 
+    // BE-029: Auto-sweep idle stablecoins for users with auto-earn enabled.
+    let sweep_pool = pool.clone();
+    let sweep_config = services::sweep_worker::SweepWorkerConfig::from_env();
+    tokio::spawn(async move {
+        services::sweep_worker::run(sweep_pool, sweep_config).await;
+    });
+
+    // BE-032: Daily / weekly yield report push notifications.
+    let notification_pool = pool.clone();
+    let notification_config = services::notifications::NotificationSchedulerConfig::from_env();
+    tokio::spawn(async move {
+        services::notifications::run(notification_pool, notification_config).await;
+    });
+
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     tracing::info!("Listening on {}", addr);
 
